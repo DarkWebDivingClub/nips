@@ -1068,6 +1068,14 @@ one; leave it empty if there is no hint to give.
   reader. The one-time public key appears nowhere in the event, so an
   author that discarded `t` and did not wrap it to itself cannot decrypt
   what it published.
+
+  **Implementations should check that their event-building library keeps
+  that tag.** Some remove a `p` tag matching the event's own author by
+  default — `nostr-sdk`'s `EventBuilder` does, and offers
+  `allow_self_tagging()` to opt out. The removal is silent, so a conforming
+  sealed payload becomes a non-conforming event with nothing to indicate
+  it. This was found by running the construction against a relay, not by
+  reading anything.
 - A reader that cannot decrypt content it requires MUST NOT proceed as
   though the content were absent or permissive. Where the content carries
   authorization, undecryptable MUST be treated as denied.
