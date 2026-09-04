@@ -654,7 +654,19 @@ Errors:
 
 #### `sign_message`
 
-Description: Signs a message with the node's identity key. Used to prove ownership of the node.
+Description: Signs a message with the node's **Lightning identity key** —
+the `node_id` it announces to its peers. This is not the Nostr key the
+node service signs its responses with, and the two are different lengths
+and encodings: a `node_id` is a 33-byte compressed secp256k1 point,
+serialised as 66 hex characters beginning `02` or `03`, while a Nostr
+pubkey is a 32-byte x-only key with no prefix.
+
+The distinction is the whole point of the method. Every response is
+already signed with the service's Nostr key, so a message signed with
+that key proves only that the service is itself. `sign_message` is how a
+controller proves that the service really does front the Lightning node
+it claims to — which is a node operator's concern, and why this is a
+control method rather than a wallet one.
 
 Request:
 ```jsonc
@@ -671,12 +683,52 @@ Response:
 {
     "result_type": "sign_message",
     "result": {
-        "message": "I am node 02abc...",  // the signed message
-        "signature": "d4e...",            // signature string
-        "pubkey": "02abc..."             // the node's pubkey that signed
+        "message": "I am node 02abc...",  // the message, echoed
+        "signature": "d9tibmnic9t5...",   // zbase32, see below
+        "pubkey": "02abc..."              // the signing node_id, hex
     }
 }
 ```
+
+Errors:
+- `INTERNAL`: The node's signer is unavailable.
+
+##### Signature scheme
+
+Implementations MUST produce the signature as:
+
+```
+signature = zbase32(SigRec(sha256d("Lightning Signed Message:" || message)))
+```
+
+A 65-byte recoverable ECDSA signature over the double-SHA256 of the
+message with the fixed ASCII prefix `Lightning Signed Message:`
+prepended, encoded in [zbase32](https://philzimmermann.com/docs/human-oriented-base-32-encoding.txt).
+
+This is not a new scheme. It is the one LND's `signmessage`, Core
+Lightning's `signmessage` and LDK's `lightning::util::message_signing`
+all implement, and their signatures verify against each other. Naming it
+here is what makes a signature produced by one node service checkable by
+a verifier that has never heard of NIP-XX — the alternative is a
+`signature` field whose contents differ per implementation, which proves
+nothing to anybody.
+
+##### The prefix is not optional
+
+`message` is chosen entirely by the caller, so without domain separation
+this method would sign arbitrary caller-supplied bytes with the node's
+identity key. The prefix is what confines a signature obtained here to
+this use, and stops it being replayed as a signature over something else
+that key is asked to sign. Implementations MUST NOT omit it, and MUST NOT
+offer a variant that signs the raw message.
+
+##### Verifying
+
+The signature is pubkey-recoverable: a verifier recovers the signing key
+from `signature` and `message`, and compares it against the `node_id` it
+expected to hear from. `pubkey` is returned for convenience only.
+Verifiers MUST NOT accept it in place of that comparison — a response
+that simply names the key it wishes it were is not a proof.
 
 ## Notifications
 
