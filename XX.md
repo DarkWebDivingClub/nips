@@ -977,6 +977,174 @@ Notification:
 
 All NNC request, response, and notification payloads MUST be encrypted using [NIP-44](44.md). The encryption uses the **client**'s private key and the **node service**'s public key.
 
+### Access grants are not encrypted
+
+**Kind `30078` access grant content is plaintext**, and this is stated so
+that it is a decision rather than an omission.
+
+The consequence is real and should be understood before publishing one: a
+node's authorization policy is public. Anyone reading the relay learns
+which keys may administer the node, which methods each may call, and what
+each may spend — which is also a map of which controller key is worth
+stealing and what it is worth. Some of that leaks regardless, since tags
+are never encrypted and the `d` tag is `node_pubkey:controller_pubkey`, but
+today the profile leaks too.
+
+#### Why it is deferred
+
+Not because it is unsolved. A construction that needs no new cryptography
+is specified in
+[Encrypting Content for Multiple Readers](#encrypting-content-for-multiple-readers)
+below — it is simply not built yet, and shipping an unimplemented
+encryption requirement would mean every existing consumer silently failing
+to read a grant it must enforce.
+
+A grant has **two** natural readers: the **node service**, which enforces
+it, and the **controller**, which is entitled to know its own limits.
+NIP-44 is strictly pairwise — one ECDH, one conversation key, one reader —
+so it cannot address both, which is what that section exists to solve.
+
+When it is adopted, a grant's readers are the **node service**, the
+**controller** it names, and the **owner** that wrote it — the last so that
+an owner can read back what it published.
+
+## Encrypting Content for Multiple Readers
+
+> **Status: specified, not yet used.** No event kind in this document
+> requires this today. It is written here because access grants will want
+> it, and written **generically** — about authors, readers and content,
+> with nothing specific to node control — because it is intended to be
+> lifted into a NIP of its own once it has an implementation and tests.
+> Implement and test it separately from the rest of this specification.
+
+### The problem
+
+[NIP-44](44.md) derives one conversation key from one ECDH, so a payload
+has exactly one author and one reader. Content that two or more parties
+must read has no standard answer: [NIP-59](59.md) gift wrap addresses each
+recipient with a **separate copy**, and the MLS-based [NIP-EE](EE.md) is
+marked `unrecommended` and superseded.
+
+Separate copies are not equivalent to one shared payload. Copies can
+disagree — an author may encrypt different plaintext to different readers,
+by accident or design — and each copy is separately replaceable, so an
+update can land for one reader and not another.
+
+### The construction
+
+Encrypt the content **once** under a one-time key, then give that key to
+each reader. Both steps use NIP-44 unchanged; no new cipher, padding
+scheme or nonce handling is introduced.
+
+**To publish**, an author with keypair `(a, A)` and readers `R₁…Rₙ`:
+
+1. Generate a one-time keypair `(t, T)` with a CSPRNG. It MUST be fresh
+   for this publication and used for nothing else.
+2. Encrypt the content with NIP-44 from `a` to `T`. This is the event's
+   `content`.
+3. For each reader `Rᵢ`, encrypt the 32-byte secret `t` with NIP-44 from
+   `a` to `Rᵢ`, and place the result at the **fourth** position of a `p`
+   tag naming `Rᵢ`.
+4. Discard `t`. Retaining it serves no purpose and extends the window in
+   which it can be stolen.
+
+**To read**, a reader with keypair `(r, R)`:
+
+1. Find the `p` tag whose second element is `R`. If it has no fourth
+   element, this reader is not addressed.
+2. Decrypt that element with NIP-44 from `r` to the event's `pubkey`,
+   recovering `t`.
+3. Decrypt `content` with NIP-44 from `t` to the event's `pubkey`.
+
+Step 3 works because NIP-44 conversation keys are symmetric — the
+specification states `conv(a, B) == conv(b, A)` — so `conv(t, A)` is the
+same key the author used as `conv(a, T)`. The one-time **public** key
+therefore never has to appear in the event.
+
+### Tag format
+
+A `p` tag is `["p", <pubkey>, <relay hint>, ...]`. [NIP-01](01.md) states
+that all elements after the second have no conventional meaning, and that
+**only a tag's first value is indexed** — so the wrapped key adds nothing
+to any relay index, and `#p` filtering still finds the event for every
+reader.
+
+```jsonc
+"tags": [
+    ["p", "<reader 1 pubkey>", "", "<one-time secret, NIP-44 from the author to reader 1>"],
+    ["p", "<reader 2 pubkey>", "", "<one-time secret, NIP-44 from the author to reader 2>"]
+]
+```
+
+The wrapped key MUST be at the fourth position. The third is a recommended
+relay URL by NIP-01 convention, and a key placed there would be read as
+one; leave it empty if there is no hint to give.
+
+### Requirements
+
+- The one-time keypair MUST be generated with a CSPRNG and MUST be fresh
+  for every publication. **Reusing it across updates of a replaceable
+  event means a reader removed by a later version still holds a key that
+  opens it**, and removal stops meaning anything.
+- An author that needs to read its own content back MUST list itself as a
+  reader. The one-time public key appears nowhere in the event, so an
+  author that discarded `t` and did not wrap it to itself cannot decrypt
+  what it published.
+- A reader that cannot decrypt content it requires MUST NOT proceed as
+  though the content were absent or permissive. Where the content carries
+  authorization, undecryptable MUST be treated as denied.
+- Implementations MUST NOT infer anything from a `p` tag with no fourth
+  element beyond "not addressed to this reader": the same event may
+  address others.
+
+### What it gives, and what it does not
+
+- **Every reader provably receives the same plaintext**, because there is
+  one ciphertext. This is the property separate copies cannot offer.
+- **The wrapped keys are authenticated.** NIP-01 serializes
+  `[0, pubkey, created_at, kind, tags, content]`, so tags are inside the
+  signed hash: a wrapped key cannot be substituted without breaking the
+  signature.
+- **Adding a reader is adding a `p` tag**, not a format change.
+- **Replaceable and addressable events keep their atomicity** — one event,
+  one `created_at`, one replacement.
+- **No forward secrecy.** A reader's long-term key being compromised
+  exposes every one-time key ever wrapped to it, and so all content it
+  could ever read. This is true of every NIP-44 payload, but it is the
+  reason this is a mitigation rather than a solution.
+- **The reader set is public.** Tags are never encrypted, so who may read
+  is visible even though what they read is not.
+- **Removal requires republishing.** A reader is removed by publishing a
+  new version with a fresh one-time key and without that reader's tag.
+  The old event, and the key it carried, remain wherever they were stored.
+
+### Known question for review
+
+NIP-44 says encrypted payloads "MUST be included in an event's payload,
+hashed, and signed as defined in NIP-01". Read strictly, *payload* means
+the `content` field, and this construction places NIP-44 payloads in tags.
+The security intent is met — they are hashed and signed, as shown above —
+but the wording does not anticipate it, and a NIP proposing this should
+say so rather than leave it to be noticed.
+
+### Testing
+
+This is a self-contained mechanism and SHOULD be implemented and tested on
+its own, independently of any event kind that uses it. A conforming
+implementation should be tested for at least:
+
+- round trip with one, two and three readers
+- a party not listed as a reader cannot decrypt the content
+- every reader recovers **identical** plaintext
+- an author listed as a reader can decrypt its own published content
+- an author *not* listed as a reader cannot
+- a reader removed in a later publication cannot read the later event
+- a `p` tag with no fourth element is treated as "not addressed", not as
+  an error, when other readers are addressed
+- a fourth element that this reader cannot decrypt is a failure, not a
+  fallback to plaintext
+- the one-time key differs between two publications of the same content
+
 ## Access Control
 
 This section defines the access control model for both NWC (NIP-47) and NNC methods. A single **node service** MAY serve both protocols and SHOULD use this unified model.
@@ -986,7 +1154,7 @@ This section defines the access control model for both NWC (NIP-47) and NNC meth
 The **owner** publishes parameterized replaceable events of kind `30078` to grant access to controllers.
 
 - The event `pubkey` is the **owner**'s pubkey.
-- The event `content` is a JSON-encoded `UsageProfile`.
+- The event `content` is a JSON-encoded `UsageProfile`. It is **not encrypted** — see [Access grants are not encrypted](#access-grants-are-not-encrypted), which is a deliberate deferral and not an oversight.
 - The event includes a `d` tag whose value is `node_pubkey:controller_pubkey`.
 - The event `tags` MUST include a `p` tag with the **node service**'s pubkey so it receives the event.
 - The event `tags` MAY include auxiliary metadata (e.g., label, scope, or policy identifiers).
