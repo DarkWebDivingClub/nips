@@ -38,7 +38,7 @@ The connection flow mirrors NIP-47:
 
 5. Most methods answer in that response. Two — `open_channel` and `close_channel` — cannot, because they wait on an on-chain confirmation: their response is an acknowledgement, and the outcome follows as an encrypted NNC notification event (kind `23200`). A **client** MAY set `"notify": false` to suppress it.
 
-6. Separately from any command's outcome, a **client** may call `subscribe_notifications` to receive notifications of chosen types — including events no controller initiated, such as a peer force-closing a channel.
+6. Separately from any command's outcome, a **client** may call `update_subscription` to receive notifications of chosen types — including events no controller initiated, such as a peer force-closing a channel.
 
 These three patterns are defined in [Commands and Notifications](#commands-and-notifications).
 
@@ -105,15 +105,15 @@ The same notification type can arrive by either.
 
 A subscription is durable state held by the **node service**: the set of
 notification types a controller wants, whatever caused them. It is edited
-by `subscribe_notifications`, which is itself an ordinary **synchronous
+by `update_subscription`, which is itself an ordinary **synchronous
 command** — it answers immediately. What it changes is what arrives later.
 
 ```
-client ──subscribe_notifications(["channel_closed"])──▶ node service
+client ──update_subscription(["channel_closed"])──▶ node service
 client ◀─response(23199)─────────────────────────── node service   set
 client ◀─notification(23200)─────────────────────── node service   any matching event
 client ◀─notification(23200)─────────────────────── node service   ...
-client ──subscribe_notifications([])──────────────────▶ node service   cleared
+client ──update_subscription([])──────────────────▶ node service   cleared
 ```
 
 There is no separate subscribe, resubscribe and unsubscribe method,
@@ -122,9 +122,9 @@ state, and every command **replaces** it.
 
 | From | Command | To |
 |---|---|---|
-| not subscribed | `subscribe_notifications(["channel_closed"])` | subscribed to `channel_closed` |
-| subscribed to `A` | `subscribe_notifications(["B"])` | subscribed to `B` — **replaced, not merged** |
-| subscribed | `subscribe_notifications([])` | not subscribed |
+| not subscribed | `update_subscription(["channel_closed"])` | subscribed to `channel_closed` |
+| subscribed to `A` | `update_subscription(["B"])` | subscribed to `B` — **replaced, not merged** |
+| subscribed | `update_subscription([])` | not subscribed |
 | subscribed | the controller's grant is revoked or narrowed | not subscribed |
 
 Replacement rather than accumulation is deliberate: a controller can state
@@ -155,7 +155,7 @@ The info event is a replaceable event published by the **node service** on the r
 The content SHOULD be a plaintext string with the supported methods space-separated:
 
 ```
-list_channels open_channel close_channel list_peers connect_peer disconnect_peer get_channel_fees set_channel_fees get_forwarding_history get_pending_htlcs query_routes list_network_nodes get_network_stats get_network_node get_network_channel sign_message subscribe_notifications
+list_channels open_channel close_channel list_peers connect_peer disconnect_peer get_channel_fees set_channel_fees get_forwarding_history get_pending_htlcs query_routes list_network_nodes get_network_stats get_network_node get_network_channel sign_message update_subscription
 ```
 
 ### Request Event (kind 23198)
@@ -886,14 +886,14 @@ notification type can arrive by either.
   subscribed to a type has asked to see every event of that type.
 - **A subscription lives and dies with the grant that permitted it.** When
   a controller's grant is revoked, or narrowed so that
-  `subscribe_notifications` is no longer permitted, its subscription ends
+  `update_subscription` is no longer permitted, its subscription ends
   and it MUST receive nothing further. A subscription that outlives its
   grant is a revocation that does not revoke.
 
 Payment-related notifications (`payment_received`, `payment_sent`) belong
 to NIP-47 (NWC).
 
-#### `subscribe_notifications`
+#### `update_subscription`
 
 **Synchronous.** A command calling this method gets its result in the
 response; what it changes is which notifications arrive later. See
@@ -906,7 +906,7 @@ caused them. **Replaces** any previous set for this controller; an empty
 Request:
 ```jsonc
 {
-    "method": "subscribe_notifications",
+    "method": "update_subscription",
     "params": {
         "types": ["channel_opened", "channel_closed"], // notification types to subscribe to, required
     }
@@ -916,7 +916,7 @@ Request:
 To unsubscribe, call with an empty types array:
 ```jsonc
 {
-    "method": "subscribe_notifications",
+    "method": "update_subscription",
     "params": {
         "types": [], // empty array unsubscribes from all
     }
@@ -926,7 +926,7 @@ To unsubscribe, call with an empty types array:
 Response:
 ```jsonc
 {
-    "result_type": "subscribe_notifications",
+    "result_type": "update_subscription",
     "result": {}
 }
 ```
