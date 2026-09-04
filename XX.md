@@ -28,7 +28,7 @@ NNC (Nostr Node Control) fills this gap. It is a companion protocol to NWC, usin
 
 The connection flow mirrors NIP-47:
 
-1. The **node service** publishes an NNC info event (kind `13198`) to its relay(s). The **owner** configures the **node service** with their pubkey and publishes access grants (kind `30078`) for authorized controllers.
+1. The **node service** publishes an NNC info event (kind `13198`) to its relay(s). The **owner** configures the **node service** with their pubkey and publishes access grants (kind `30198`) for authorized controllers.
 
 2. The **user** imports the connection URI into their **client** (QR code, deeplink, or paste). The **client** fetches the info event to discover which NNC methods the **node service** supports.
 
@@ -38,7 +38,7 @@ The connection flow mirrors NIP-47:
 
 5. Most methods answer in that response. Two — `open_channel` and `close_channel` — cannot, because they wait on an on-chain confirmation: their response is an acknowledgement, and the outcome follows as an encrypted NNC notification event (kind `23200`). A **client** MAY set `"notify": false` to suppress it.
 
-6. Separately from any command's outcome, a **client** may call `update_subscription` to receive notifications of chosen types — including events no controller initiated, such as a peer force-closing a channel.
+6. Separately from any command's outcome, a **controller** may publish a subscription (kind `30199`) naming notification types it wants — including events no controller initiated, such as a peer force-closing a channel.
 
 These three patterns are defined in [Commands and Notifications](#commands-and-notifications).
 
@@ -103,33 +103,40 @@ The same notification type can arrive by either.
 
 ### Subscriptions
 
-A subscription is durable state held by the **node service**: the set of
-notification types a controller wants, whatever caused them. It is edited
-by `update_subscription`, which is itself an ordinary **synchronous
-command** — it answers immediately. What it changes is what arrives later.
+A subscription is **not a command**. It is durable state a controller
+publishes for itself: a kind `30199` event naming the notification types it
+wants, whatever caused them. See
+[Subscriptions (kind 30199)](#subscriptions-kind-30199) for the event.
 
 ```
-client ──update_subscription(["channel_closed"])──▶ node service
-client ◀─response(23199)─────────────────────────── node service   set
-client ◀─notification(23200)─────────────────────── node service   any matching event
-client ◀─notification(23200)─────────────────────── node service   ...
-client ──update_subscription([])──────────────────▶ node service   cleared
+controller ──subscription(30199, ["channel_closed"])──▶ relay
+node service ◀────────────────────────────────────────── reads it
+client ◀─notification(23200)─────────────── node service   any matching event
+client ◀─notification(23200)─────────────── node service   ...
+controller ──subscription(30199, [])──────────────────▶ relay   cleared
 ```
 
-There is no separate subscribe, resubscribe and unsubscribe method,
-because there is nothing to distinguish: a subscription has one piece of
-state, and every command **replaces** it.
+There is no subscribe, resubscribe or unsubscribe method, because there is
+nothing to distinguish between them: a subscription has one piece of state,
+the event is addressable, and publishing a new one **replaces** it.
 
-| From | Command | To |
+| From | The controller publishes | To |
 |---|---|---|
-| not subscribed | `update_subscription(["channel_closed"])` | subscribed to `channel_closed` |
-| subscribed to `A` | `update_subscription(["B"])` | subscribed to `B` — **replaced, not merged** |
-| subscribed | `update_subscription([])` | not subscribed |
-| subscribed | the controller's grant is revoked or narrowed | not subscribed |
+| not subscribed | `["channel_closed"]` | subscribed to `channel_closed` |
+| subscribed to `A` | `["B"]` | subscribed to `B` — **replaced, not merged** |
+| subscribed | `[]` | not subscribed |
+| — | *(the controller's grant is revoked or narrowed)* | not subscribed |
+
+Making it an event rather than a command is what makes it survive. A
+subscription established by a command lives in the node service's memory,
+so a restart drops every subscription silently — and a controller watching
+for a force-close cannot distinguish a dropped subscription from a quiet
+node, which is the worst way for monitoring to fail. An addressable event
+is re-read on startup exactly as grants are.
 
 Replacement rather than accumulation is deliberate: a controller can state
 what it wants without knowing what it previously asked for, so a
-reconnecting client is one command away from a known state rather than
+reconnecting client is one publication away from a known state rather than
 having to reconcile. It also means the node service holds one bounded set
 per controller and nothing that grows.
 
@@ -141,12 +148,21 @@ exists to monitor a node needs this source, not the first one.
 
 ## Events
 
-There are four event kinds:
+There are six event kinds. Four carry traffic and are not stored; two hold
+durable state and are addressable, so the latest replaces the previous.
 
-- `NNC info event`: **13198** (replaceable)
-- `NNC request`: **23198** (ephemeral)
-- `NNC response`: **23199** (ephemeral)
-- `NNC notification event`: **23200** (ephemeral)
+| Kind | Event | Published by | Storage |
+|---|---|---|---|
+| **13198** | NNC info event | node service | replaceable |
+| **23198** | NNC request | client | ephemeral |
+| **23199** | NNC response | node service | ephemeral |
+| **23200** | NNC notification | node service | ephemeral |
+| **30198** | [access grant](#access-grants-kind-30198) | owner | addressable |
+| **30199** | [subscription](#subscriptions-kind-30199) | controller | addressable |
+
+The two addressable kinds are the protocol's only durable state, and they
+are symmetric: an owner publishes what a controller **may** do, and a
+controller publishes what it **wants** to be told about.
 
 ### Info Event (kind 13198)
 
@@ -155,7 +171,7 @@ The info event is a replaceable event published by the **node service** on the r
 The content SHOULD be a plaintext string with the supported methods space-separated:
 
 ```
-list_channels open_channel close_channel list_peers connect_peer disconnect_peer get_channel_fees set_channel_fees get_forwarding_history get_pending_htlcs query_routes list_network_nodes get_network_stats get_network_node get_network_channel sign_message update_subscription
+list_channels open_channel close_channel list_peers connect_peer disconnect_peer get_channel_fees set_channel_fees get_forwarding_history get_pending_htlcs query_routes list_network_nodes get_network_stats get_network_node get_network_channel sign_message
 ```
 
 ### Request Event (kind 23198)
@@ -236,7 +252,7 @@ The connection URI uses the protocol `nostr+nodecontrol://` and base path the he
 
 - `relay` Required. URL of the relay where the **node service** is connected and will be listening for events. May be more than one.
 
-The **client** uses its own key pair to sign events and encrypt payloads. The **owner** must publish an access grant (kind `30078`) for the **client**'s pubkey before it can issue requests.
+The **client** uses its own key pair to sign events and encrypt payloads. The **owner** must publish an access grant (kind `30198`) for the **client**'s pubkey before it can issue requests.
 
 ### Example connection string
 
@@ -884,54 +900,16 @@ notification type can arrive by either.
 - `"notify": false` suppresses the asynchronous-command route for that
   operation. It does **not** suppress a subscription: a controller that
   subscribed to a type has asked to see every event of that type.
-- **A subscription lives and dies with the grant that permitted it.** When
-  a controller's grant is revoked, or narrowed so that
-  `update_subscription` is no longer permitted, its subscription ends
-  and it MUST receive nothing further. A subscription that outlives its
-  grant is a revocation that does not revoke.
+- **A subscription lives and dies with the grant that permits it.** A
+  subscription event grants nothing by itself: it states what a controller
+  *wants*, and the grant states what it *may have*. Delivery is the
+  intersection. When a grant is revoked or narrowed, delivery stops at once
+  and the subscription event — which the node service does not own and
+  cannot delete — becomes inert. A subscription that outlived its grant
+  would be a revocation that does not revoke.
 
 Payment-related notifications (`payment_received`, `payment_sent`) belong
 to NIP-47 (NWC).
-
-#### `update_subscription`
-
-**Synchronous.** A command calling this method gets its result in the
-response; what it changes is which notifications arrive later. See
-[Subscriptions](#subscriptions).
-
-Description: Sets the notification types this controller receives, whatever
-caused them. **Replaces** any previous set for this controller; an empty
-`types` array clears it.
-
-Request:
-```jsonc
-{
-    "method": "update_subscription",
-    "params": {
-        "types": ["channel_opened", "channel_closed"], // notification types to subscribe to, required
-    }
-}
-```
-
-To unsubscribe, call with an empty types array:
-```jsonc
-{
-    "method": "update_subscription",
-    "params": {
-        "types": [], // empty array unsubscribes from all
-    }
-}
-```
-
-Response:
-```jsonc
-{
-    "result_type": "update_subscription",
-    "result": {}
-}
-```
-
-Payment-related notifications (`payment_received`, `payment_sent`) belong to NIP-47 (NWC).
 
 ### `channel_opened`
 
@@ -979,7 +957,7 @@ All NNC request, response, and notification payloads MUST be encrypted using [NI
 
 ### Access grants are not encrypted
 
-**Kind `30078` access grant content is plaintext**, and this is stated so
+**Kind `30198` access grant content is plaintext**, and this is stated so
 that it is a decision rather than an omission.
 
 The consequence is real and should be understood before publishing one: a
@@ -1149,9 +1127,9 @@ implementation should be tested for at least:
 
 This section defines the access control model for both NWC (NIP-47) and NNC methods. A single **node service** MAY serve both protocols and SHOULD use this unified model.
 
-### Access Grants (kind 30078)
+### Access Grants (kind 30198)
 
-The **owner** publishes parameterized replaceable events of kind `30078` to grant access to controllers.
+The **owner** publishes addressable events of kind `30198` to grant access to controllers.
 
 - The event `pubkey` is the **owner**'s pubkey.
 - The event `content` is a JSON-encoded `UsageProfile`. It is **not encrypted** — see [Access grants are not encrypted](#access-grants-are-not-encrypted), which is a deliberate deferral and not an oversight.
@@ -1160,6 +1138,26 @@ The **owner** publishes parameterized replaceable events of kind `30078` to gran
 - The event `tags` MAY include auxiliary metadata (e.g., label, scope, or policy identifiers).
 - The event is signed by the **owner** and published to the relay(s) from the connection URI.
 - Subsequent updates use the same kind, pubkey, and `d` tag; the newest `created_at` replaces earlier grants.
+
+#### Why not kind 30078
+
+Earlier drafts used kind `30078`, [NIP-78](78.md)'s arbitrary application
+data. That was wrong for two reasons, and the second is not theoretical.
+
+NIP-78 states its own scope: *"These kinds are not meant to be used as a
+generic interchange format for data that should be public or exchanged
+between different applications. Applications that need such
+interoperability should use dedicated kinds instead."* A grant is written
+by an owner's tool and read by an independent node service, which is
+exactly the case it excludes.
+
+More seriously, NIP-78 says relays *"SHOULD only serve these events to the
+authenticated owner, i.e. the client must authenticate with the same pubkey
+as the event author."* A grant's author is the **owner**; the reader that
+must have it is the **node service**. On a relay that implements NIP-78 as
+written, a node service can never fetch its own grants, and authorization
+fails closed for reasons nothing in this protocol can diagnose. Using
+`30078` meant depending on relays *not* implementing it correctly.
 
 #### The `OTHERS` controller
 
@@ -1201,6 +1199,52 @@ Revocation is unchanged and composes with this. A specific controller is
 denied by publishing an empty grant for it — an explicit entry beats
 `OTHERS`, so an empty grant is a deny-list entry.
 
+### Subscriptions (kind 30199)
+
+A **controller** publishes addressable events of kind `30199` to say which
+notification types it wants to receive.
+
+- The event `pubkey` is the **controller**'s pubkey. A controller
+  subscribes for itself and for nobody else; there is no third party to
+  name, which is why the `d` tag is shorter than a grant's.
+- The event includes a `d` tag whose value is `node_pubkey`.
+- The event `tags` MUST include a `p` tag with the **node service**'s
+  pubkey so it receives the event.
+- The event `content` is a JSON array of notification type names, e.g.
+  `["channel_opened", "channel_closed"]`. An empty array subscribes to
+  nothing.
+- Subsequent updates use the same kind, pubkey and `d` tag; the newest
+  `created_at` replaces earlier subscriptions.
+
+```jsonc
+{
+    "kind": 30199,
+    "pubkey": "<controller_pubkey>",
+    "tags": [
+        ["d", "<node_pubkey>"],
+        ["p", "<node_pubkey>"]
+    ],
+    "content": "[\"channel_closed\"]"
+}
+```
+
+A node service MUST verify that the `d` tag names itself before applying a
+subscription, exactly as it does for a grant. It MUST NOT accept a
+subscription whose author differs from the controller it would subscribe —
+the author *is* the subscriber, so there is nothing else it could mean.
+
+**A subscription authorizes nothing.** It states a want. What a controller
+may actually receive is in its grant, and delivery is the intersection of
+the two. A controller with no grant, or whose grant permits no notification
+types, receives nothing however it subscribes — deny by default, as
+everywhere else. There is no response and therefore no error: an
+unauthorized subscription is silent, not refused.
+
+A node service SHOULD NOT hold subscription state for a controller with no
+grant. Anyone may publish a kind `30199` event naming any node, so a
+registry keyed by whoever published one is unbounded; keyed by controllers
+that hold grants, it is bounded by the grants the owner wrote.
+
 ### UsageProfile JSON
 
 The `UsageProfile` defines per-controller permissions and limits. All numeric values are unsigned integers.
@@ -1223,6 +1267,10 @@ The `UsageProfile` defines per-controller permissions and limits. All numeric va
     "open_channel": {},
     "close_channel": {},
     "list_channels": {}
+  },
+  "notifications": {
+    "channel_opened": {},
+    "channel_closed": {}
   },
   "quota": {
     "amount": 100000,
@@ -1251,6 +1299,10 @@ Fields:
     - `amount` (u64, optional): Tokens added per period. Default `0`.
     - `per_secs` (u64, optional): The period, in seconds. Default `1`. MUST be greater than `0` — see *Invalid values*.
     - `max_capacity` (u64, optional): Maximum token capacity. Default `u64::MAX`.
+- `notifications` (object, optional): Map of notification type name to an empty object, naming the types this controller may receive. Absent or empty permits **none**. `OTHERS` may be used as a key, with the same meaning as elsewhere: it covers every type not named.
+
+    This is what a kind `30199` subscription is intersected with. A controller receives a notification type only if it appears here *and* in that controller's subscription — except for the deferred outcome of an asynchronous command it issued itself, which needs no entry: a controller permitted to call `open_channel` is permitted to be told how it went.
+
 - `quota` (object, optional): Controller-wide spending quota. If missing, no quota is applied. **One token is one satoshi.**
     - `amount` (u64, optional): Satoshis added per period. Default `0`.
     - `per_secs` (u64, optional): The period, in seconds. Default `1`. MUST be greater than `0` — see *Invalid values*.
@@ -1395,7 +1447,7 @@ Step 1 ensures immediate revocation regardless of whether the relay processes th
 
 ### Authorization Steps
 
-1. Resolve the grant that applies to the caller: the latest kind `30078` grant for `d = node_pubkey:controller_pubkey` if one exists, otherwise the one for `d = node_pubkey:OTHERS`. If neither exists, deny with `UNAUTHORIZED`.
+1. Resolve the grant that applies to the caller: the latest kind `30198` grant for `d = node_pubkey:controller_pubkey` if one exists, otherwise the one for `d = node_pubkey:OTHERS`. If neither exists, deny with `UNAUTHORIZED`.
 2. Parse the grant content as `UsageProfile`. If parsing fails, deny with `UNAUTHORIZED`.
 3. Look up the requested method in the applicable map — `methods` for NWC requests, `control` for NNC requests. If the map is missing, empty, or the requested method is not present and `"OTHERS"` is not present, deny with `RESTRICTED`.
 4. Check per-method rate limit (from the `rate` field on the method entry). If the rate is exceeded, deny with `RATE_LIMITED`.
