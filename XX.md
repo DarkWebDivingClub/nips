@@ -1020,9 +1020,10 @@ scheme or nonce handling is introduced.
    for this publication and used for nothing else.
 2. Encrypt the content with NIP-44 from `a` to `T`. This is the event's
    `content`.
-3. For each reader `Rᵢ`, encrypt the 32-byte secret `t` with NIP-44 from
-   `a` to `Rᵢ`, and place the result at the **fourth** position of a `p`
-   tag naming `Rᵢ`.
+3. For each reader `Rᵢ`, encrypt the one-time secret `t` — serialised as
+   **64 lowercase hexadecimal characters** — with NIP-44 from `a` to `Rᵢ`,
+   and place the result at the **fourth** position of a `p` tag naming
+   `Rᵢ`.
 4. Discard `t`. Retaining it serves no purpose and extends the window in
    which it can be stolen.
 
@@ -1031,13 +1032,39 @@ scheme or nonce handling is introduced.
 1. Find the `p` tag whose second element is `R`. If it has no fourth
    element, this reader is not addressed.
 2. Decrypt that element with NIP-44 from `r` to the event's `pubkey`,
-   recovering `t`.
+   recovering the hexadecimal `t`. A payload that is not 64 hexadecimal
+   characters encoding a valid secret key is a failure, not a key.
 3. Decrypt `content` with NIP-44 from `t` to the event's `pubkey`.
 
 Step 3 works because NIP-44 conversation keys are symmetric — the
 specification states `conv(a, B) == conv(b, A)` — so `conv(t, A)` is the
 same key the author used as `conv(a, T)`. The one-time **public** key
 therefore never has to appear in the event.
+
+#### Why hex, and not raw bytes or `nsec`
+
+The wrapped key is **hex**, and both alternatives are ruled out rather than
+merely disfavoured.
+
+**Not raw bytes.** Thirty-two raw key bytes are not valid UTF-8. Many
+NIP-44 implementations expose only `encrypt(sk, pk, string) -> string` and
+`decrypt(...) -> string`, with no bytes-level entry point, and cannot carry
+such a payload at all. A construction that only some libraries can express
+is not one that gets adopted.
+
+**Not `nsec`.** [NIP-19](19.md) says of its bech32 forms that they are
+*"not meant to be used anywhere in the core protocol"* and *"not meant to
+be used inside the standard NIP-01 event formats"* — they exist for
+display, copy-paste and QR codes.
+
+**Hex is what Nostr already uses for keys inside events** — NIP-01
+serialises a `p` tag's pubkey as 32 bytes of lowercase hex — so a wrapped
+secret in the same encoding needs no explanation.
+
+The cost is 32 additional plaintext bytes per reader. Under NIP-44's
+padding a 32-byte plaintext pads to 32 and a 64-byte plaintext to 64, so a
+wrapped key grows from roughly 132 to roughly 176 base64 characters: once
+per reader, per publication.
 
 ### Tag format
 
@@ -1130,6 +1157,8 @@ implementation should be tested for at least:
 - a fourth element that this reader cannot decrypt is a failure, not a
   fallback to plaintext
 - the one-time key differs between two publications of the same content
+- a wrapped key that decrypts to something other than 64 hexadecimal
+  characters is rejected rather than coerced
 
 ## Access Control
 
