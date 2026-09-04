@@ -51,7 +51,7 @@ The info event is a replaceable event published by the **node service** on the r
 The content SHOULD be a plaintext string with the supported methods space-separated:
 
 ```
-list_channels open_channel close_channel list_peers connect_peer disconnect_peer get_channel_fees set_channel_fees get_forwarding_history get_pending_htlcs query_routes list_network_nodes get_network_stats get_network_node get_network_channel subscribe_notifications
+list_channels open_channel close_channel list_peers connect_peer disconnect_peer get_channel_fees set_channel_fees get_forwarding_history get_pending_htlcs query_routes list_network_nodes get_network_stats get_network_node get_network_channel sign_message subscribe_notifications
 ```
 
 ### Request Event (kind 23198)
@@ -650,6 +650,34 @@ Response:
 Errors:
 - `NOT_FOUND`: The channel was not found in the graph.
 
+### Node Identity
+
+#### `sign_message`
+
+Description: Signs a message with the node's identity key. Used to prove ownership of the node.
+
+Request:
+```jsonc
+{
+    "method": "sign_message",
+    "params": {
+        "message": "I am node 02abc..."   // message to sign, required
+    }
+}
+```
+
+Response:
+```jsonc
+{
+    "result_type": "sign_message",
+    "result": {
+        "message": "I am node 02abc...",  // the signed message
+        "signature": "d4e...",            // signature string
+        "pubkey": "02abc..."             // the node's pubkey that signed
+    }
+}
+```
+
 ## Notifications
 
 ### Notification Model
@@ -755,6 +783,46 @@ The **owner** publishes parameterized replaceable events of kind `30078` to gran
 - The event is signed by the **owner** and published to the relay(s) from the connection URI.
 - Subsequent updates use the same kind, pubkey, and `d` tag; the newest `created_at` replaces earlier grants.
 
+#### The `OTHERS` controller
+
+A grant MAY use the literal `OTHERS` in place of a controller pubkey:
+
+```
+d = <node_pubkey>:OTHERS
+```
+
+This is a grant like any other; what differs is who it names. It applies
+to **every controller not named by a grant of its own**, and a grant
+naming a specific pubkey takes precedence over it. A controller matched
+by neither is denied with `UNAUTHORIZED`, exactly as before.
+
+Its limits are instantiated **per controller**: each unknown key gets its
+own buckets of that size. A single shared bucket would let one caller
+starve every other.
+
+This is what makes a service open to callers the owner has never seen —
+a public faucet, a demo node, a test service.
+
+Two things about it are worth knowing before using it. Neither is a
+prohibition; an owner who wants either can have it.
+
+- **Per-controller limits under `OTHERS` bound nothing on their own.**
+  Nostr keys are free, so a caller can hold as many allowances as it
+  cares to generate, and `quota` under `OTHERS` is advisory against
+  anyone who notices. The only limit that binds is an aggregate one
+  across all `OTHERS`-derived access, and a node service offering
+  `OTHERS` SHOULD enforce one. It belongs to the node rather than to a
+  grant, so that raising it is a deliberate act by whoever runs the node
+  rather than a side effect of publishing.
+- **`OTHERS` may name `control` methods**, and that grants node
+  administration to callers the owner has never seen — including
+  whichever of them arrives first. It is permitted because the owner may
+  have a reason; it is rarely what is meant.
+
+Revocation is unchanged and composes with this. A specific controller is
+denied by publishing an empty grant for it — an explicit entry beats
+`OTHERS`, so an empty grant is a deny-list entry.
+
 ### UsageProfile JSON
 
 The `UsageProfile` defines per-controller permissions and limits. All numeric values are unsigned integers.
@@ -765,7 +833,8 @@ The `UsageProfile` defines per-controller permissions and limits. All numeric va
     "get_info": {},
     "get_balance": {
       "rate": {
-        "rate_per_micro": 10,
+        "amount": 1000,
+        "per_secs": 3600,
         "max_capacity": 1000
       }
     },
@@ -778,7 +847,8 @@ The `UsageProfile` defines per-controller permissions and limits. All numeric va
     "list_channels": {}
   },
   "quota": {
-    "rate_per_micro": 1,
+    "amount": 100000,
+    "per_secs": 86400,
     "max_capacity": 1000000
   }
 }
@@ -788,25 +858,142 @@ Fields:
 
 - `methods` (object, optional): Map of NWC method name to a `MethodAccessRule`.
     - Missing or empty `methods` means no NWC permissions are granted.
-    - The special key `"ALL"` grants access to all NWC methods. Rate limits on the `"ALL"` entry apply to every method.
-    - A method MUST be explicitly present (or `"ALL"` granted) to be allowed.
+    - The special key `"OTHERS"` supplies the rule for every NWC method **not named** in the map. An explicit entry always takes precedence over `"OTHERS"`.
+    - Its rate limit is instantiated **per method**: each unnamed method gets its own bucket of that size, not a shared one.
+    - A method MUST be explicitly present, or `"OTHERS"` MUST be present, to be allowed.
 - `control` (object, optional): Map of NNC method name to a `MethodAccessRule`.
     - Missing or empty `control` means no NNC permissions are granted.
-    - The special key `"ALL"` grants access to all NNC methods. Rate limits on the `"ALL"` entry apply to every method.
-    - A method MUST be explicitly present (or `"ALL"` granted) to be allowed.
-- `methods.<method>.rate` (object, optional): Per-method rate limit. If missing, no rate limit is applied.
-    - `rate_per_micro` (u64, optional): Tokens refilled per microsecond. Default `0`.
+    - The special key `"OTHERS"` supplies the rule for every NNC method **not named** in the map, with the same precedence and per-method instantiation as in `methods`.
+    - A method MUST be explicitly present, or `"OTHERS"` MUST be present, to be allowed.
+- `methods.<method>.rate` (object, optional): Per-method rate limit. If missing, no rate limit is applied. **One token is one call.**
+    - `amount` (u64, optional): Tokens added per period. Default `0`.
+    - `per_secs` (u64, optional): The period, in seconds. Default `1`. MUST be greater than `0` — see *Invalid values*.
     - `max_capacity` (u64, optional): Maximum token capacity. Default `u64::MAX`.
-- `control.<method>.rate` (object, optional): Per-control-method rate limit. If missing, no rate limit is applied.
-    - `rate_per_micro` (u64, optional): Tokens refilled per microsecond. Default `0`.
+- `control.<method>.rate` (object, optional): Per-control-method rate limit. If missing, no rate limit is applied. **One token is one call.**
+    - `amount` (u64, optional): Tokens added per period. Default `0`.
+    - `per_secs` (u64, optional): The period, in seconds. Default `1`. MUST be greater than `0` — see *Invalid values*.
     - `max_capacity` (u64, optional): Maximum token capacity. Default `u64::MAX`.
-- `quota` (object, optional): Controller-wide spending quota. If missing, no quota is applied.
-    - `rate_per_micro` (u64, optional): Quota refill per microsecond. Default `0`.
-    - `max_capacity` (u64, optional): Maximum quota capacity. Default `u64::MAX`.
+- `quota` (object, optional): Controller-wide spending quota. If missing, no quota is applied. **One token is one satoshi.**
+    - `amount` (u64, optional): Satoshis added per period. Default `0`.
+    - `per_secs` (u64, optional): The period, in seconds. Default `1`. MUST be greater than `0` — see *Invalid values*.
+    - `max_capacity` (u64, optional): Maximum quota capacity, in satoshis. Default `u64::MAX`.
+
+#### Invalid values
+
+A grant arrives over a relay and may say anything. Every value a node
+service reads is therefore input, not configuration, and the spec says
+what to do rather than leaving each implementation to decide.
+
+**`per_secs` must be greater than `0`.** Zero is a division by zero in
+the refill, and there is no sensible value to substitute: treating it as
+`1` invents a rate nobody asked for, and treating it as "no refill"
+silently converts a rate limit into a one-off allowance.
+
+The constraint is stated on the **value**, not left to the type. JSON
+carries no unsigned integers, and an implementation is free to hold these
+fields in a signed type — so `-1` may reach a parser that `u64` would
+have refused. Every numeric field in a `UsageProfile` is a non-negative
+integer, and a value that is negative, fractional, or too large for the
+implementation's type is invalid on the same terms as `per_secs = 0`.
+
+An implementation MUST reject such a profile as it would any
+unparseable one — Authorization step 2 — and deny with `UNAUTHORIZED`. It
+MUST NOT fall back to a default, and MUST NOT leave an older, more
+generous grant in force: a grant that cannot be understood grants
+nothing.
+
+Values that are **valid**, and should not be rejected:
+
+- `amount = 0` — a one-off allowance, defined below.
+- `max_capacity = 0` — an allowance of nothing, which denies every
+  request. This is a legitimate way to say "permitted, but not yet", and
+  is distinct from omitting the method, which is `RESTRICTED`.
+
+#### How a bucket behaves
+
+A bucket holds tokens. It starts full, at `max_capacity`, when the grant
+is applied.
+
+Refill is **continuous**, not periodic: a bucket does not pay out in a
+lump at each period boundary. At any instant it holds
+
+```
+min(balance + amount × elapsed_secs / per_secs, max_capacity)
+```
+
+where `balance` is what it held at `since`, and `elapsed` is the time
+from `since` to now. `max_capacity` is therefore what separates a rate
+limit from an allowance: set it equal to `amount` and a controller can
+never bank more than one period's worth; set it higher and unused
+allowance accumulates up to that ceiling.
+
+**Checking a limit MUST NOT mutate the bucket**, and **consuming MUST
+happen only after the request has succeeded** — pipeline steps 4 and 7.
+A refused request, or one whose execution failed, leaves every counter
+untouched, so a caller is never charged for something they did not
+receive.
+
+**When tokens are consumed, `since` advances to that instant, and it
+advances at no other time.** Leaving it behind causes the interval before
+each withdrawal to be credited again at every later check, so the bucket
+refills faster than its rule specifies. Advancing it on a mere check
+discards the truncated remainder of the division and the bucket leaks.
+
+Implementations should note that `amount × elapsed` can exceed 64 bits
+for a large allowance over a long interval, and compute the refill in a
+wider type.
+
+#### Worked example
+
+```jsonc
+{
+  "methods": {
+    "pay_invoice": { "rate": { "amount": 5, "per_secs": 604800, "max_capacity": 5 } },
+    "OTHERS":      { }
+  },
+  "control": {
+    "list_channels": { }
+  },
+  "quota": { "amount": 100000, "per_secs": 604800, "max_capacity": 100000 }
+}
+```
+
+| Request | Outcome |
+|---|---|
+| `pay_invoice` | allowed, five a week — the explicit entry wins |
+| `get_balance` | allowed, unlimited — falls to `OTHERS`, which carries no rate |
+| `list_channels` (NNC) | allowed |
+| `open_channel` (NNC) | denied, `RESTRICTED` — `control` has no `OTHERS` |
+
+The two maps are independent. Being permitted to spend does not make a
+controller an administrator, and an `OTHERS` in `methods` says nothing
+about `control`.
 
 Defaults:
 
-- Missing numeric fields use their defaults (`rate_per_micro = 0`, `max_capacity = u64::MAX`).
+- Missing numeric fields use their defaults (`amount = 0`, `per_secs = 1`, `max_capacity = u64::MAX`).
+- `amount = 0` means the bucket never refills: the controller receives `max_capacity` tokens once and no more until a new grant is published. An implementation MUST NOT offer a retry time for it, because none will arrive.
+
+**A limit that is absent and a limit of zero are opposites**, and they are
+easily confused because they sit next to each other:
+
+| `rate` | meaning |
+|---|---|
+| absent | **no limit at all** — the method may be called without restriction |
+| `{ "amount": 0, "max_capacity": 1000 }` | **1000 tokens, ever** — the strictest bound expressible |
+| `{ "amount": 5, "per_secs": 604800, "max_capacity": 5 }` | five per week, banking at most five |
+
+Omitting a limit is permissive; a zero refill rate is the most
+restrictive setting there is. An implementation that treats a missing
+`rate` as "no allowance" is as wrong as one that treats `amount = 0` as
+"unlimited", and both mistakes are silent.
+
+A non-refilling bucket is a supported configuration rather than a
+degenerate one. It expresses a one-off allowance — a fixed budget for a
+task, a bounded trial, a grant that should be topped up deliberately
+rather than by the passage of time. `per_secs` is unused in that case but
+MUST still be valid, since an implementation may compute the refill
+before noticing that `amount` is zero.
 - Missing optional objects are treated as absent limits.
 
 ### Revocation
@@ -830,9 +1017,9 @@ Step 1 ensures immediate revocation regardless of whether the relay processes th
 
 ### Authorization Steps
 
-1. Resolve the caller's latest kind `30078` grant for `d = node_pubkey:controller_pubkey`. If missing, deny with `UNAUTHORIZED`.
+1. Resolve the grant that applies to the caller: the latest kind `30078` grant for `d = node_pubkey:controller_pubkey` if one exists, otherwise the one for `d = node_pubkey:OTHERS`. If neither exists, deny with `UNAUTHORIZED`.
 2. Parse the grant content as `UsageProfile`. If parsing fails, deny with `UNAUTHORIZED`.
-3. Look up the requested method in the applicable map — `methods` for NWC requests, `control` for NNC requests. If the map is missing, empty, or the requested method is not present and `"ALL"` is not present, deny with `RESTRICTED`.
+3. Look up the requested method in the applicable map — `methods` for NWC requests, `control` for NNC requests. If the map is missing, empty, or the requested method is not present and `"OTHERS"` is not present, deny with `RESTRICTED`.
 4. Check per-method rate limit (from the `rate` field on the method entry). If the rate is exceeded, deny with `RATE_LIMITED`.
 5. Check `quota`. If the method involves spending and the quota is exceeded, deny with `QUOTA_EXCEEDED`.
 6. Grant access.
