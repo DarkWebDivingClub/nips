@@ -12,14 +12,17 @@ Nostr Node Control (NNC)
 
 However, Lightning node owners and administrators need a separate set of operations to **manage their node**: opening and closing channels, connecting to peers, adjusting fee policies, inspecting the network graph, and monitoring routing activity. These operations do not belong in a wallet protocol because they change the node's topology and configuration rather than moving funds.
 
-NNC (Nostr Node Control) fills this gap. It is a companion protocol to NWC, using the same architectural patterns (connection URI, encrypted request/response over relays, replaceable info event) but with a distinct set of commands for node administration.
+NNC (Nostr Node Control) fills this gap. It is a companion protocol to NWC, using the same architectural patterns (connection URI, encrypted request/response over relays, replaceable info event) but with a distinct set of methods for node administration.
 
 ## Terms
 
 * **client**: Nostr app on any platform that wants to manage a Lightning node.
 * **user**: The person using the **client**, typically the node owner or an authorized administrator.
 * **node service**: Nostr app running alongside the Lightning node (or on the node itself) that translates NNC requests into node API calls. This is analogous to the NIP-47 **wallet service**.
-* **owner**: The node operator who controls access grants.
+* **controller**: The keypair a **client** uses to reach a **node service**. Access is granted to a controller, not to an app: a grant names `controller_pubkey`, and every request is authorized by the key that signed it. One user may hold several — a phone, a dashboard, a script — with different permissions.
+* **owner**: The node operator who controls access grants. An owner's key is the only one whose grants a **node service** accepts. An owner need not be a controller, and a controller is not an owner.
+* **method**: An operation a **node service** implements, named in a request's `method` field — `open_channel`, `get_channel_fees`, and so on. Methods are what this document defines.
+* **command**: A request that calls a method. Every command is either **synchronous** or **asynchronous**, according to the method it calls: a synchronous command's response carries the result, an asynchronous command's response is an acknowledgement and the result follows as a notification.
 
 ## Theory of Operation
 
@@ -33,7 +36,108 @@ The connection flow mirrors NIP-47:
 
 4. The **node service** decrypts the request, executes the operation against the Lightning node, and publishes an encrypted NNC response event (kind `23199`).
 
-5. For methods with deferred outcomes (e.g. channel open/close), the **node service** sends an encrypted NNC notification event (kind `23200`) back to the requesting **client** when the operation completes. The **client** MAY set `"notify": false` to suppress this notification.
+5. Most methods answer in that response. Two — `open_channel` and `close_channel` — cannot, because they wait on an on-chain confirmation: their response is an acknowledgement, and the outcome follows as an encrypted NNC notification event (kind `23200`). A **client** MAY set `"notify": false` to suppress it.
+
+6. Separately from any command's outcome, a **client** may call `subscribe_notifications` to receive notifications of chosen types — including events no controller initiated, such as a peer force-closing a channel.
+
+These three patterns are defined in [Commands and Notifications](#commands-and-notifications).
+
+## Commands and Notifications
+
+A **command** calls a **method**. Every command is one of **two** kinds,
+fixed by the method it calls and stated on every method below.
+
+### Synchronous command
+
+Request → response, and the response carries the result. Most methods are
+synchronous: the **node service** can answer from what it already knows, or
+complete the work before replying.
+
+```
+client ──request(23198)──▶ node service
+client ◀─response(23199)── node service   result
+```
+
+### Asynchronous command
+
+Request → response → notification. The work cannot finish inside a
+request, so the response is an **acknowledgement** — the node service has
+accepted the work — and the outcome follows later as a notification to the
+controller that issued the command.
+
+```
+client ──request(23198)────▶ node service
+client ◀─response(23199)──── node service   accepted
+                            ...time passes, the operation completes...
+client ◀─notification(23200)─ node service   outcome
+```
+
+**Only `open_channel` and `close_channel` are asynchronous methods.** Both
+wait on an on-chain confirmation, which is why they cannot answer
+synchronously.
+
+Two rules keep the acknowledgement honest:
+
+- **A success response means *accepted*, never *done*.** It does not say
+  the channel exists.
+- **Anything knowable immediately MUST be an error, not a deferred
+  failure** — an unknown peer, insufficient funds, a malformed request. A
+  controller can then tell *refused* from *in progress* from the response
+  alone, without waiting for a notification that may never come.
+
+Set `"notify": false` in the request to suppress the notification for that
+operation. The operation still happens; only the message about it is
+suppressed.
+
+### Where notifications come from
+
+A subscription is **not** a third kind of command. Notifications have
+exactly two sources:
+
+| Source | Sent to | Stops |
+|---|---|---|
+| an asynchronous command completing | the controller that issued it | when the operation completes — one notification |
+| a **subscription** | every subscribed controller | on unsubscribe, or when the controller's grant is revoked |
+
+The same notification type can arrive by either.
+
+### Subscriptions
+
+A subscription is durable state held by the **node service**: the set of
+notification types a controller wants, whatever caused them. It is edited
+by `subscribe_notifications`, which is itself an ordinary **synchronous
+command** — it answers immediately. What it changes is what arrives later.
+
+```
+client ──subscribe_notifications(["channel_closed"])──▶ node service
+client ◀─response(23199)─────────────────────────── node service   set
+client ◀─notification(23200)─────────────────────── node service   any matching event
+client ◀─notification(23200)─────────────────────── node service   ...
+client ──subscribe_notifications([])──────────────────▶ node service   cleared
+```
+
+There is no separate subscribe, resubscribe and unsubscribe method,
+because there is nothing to distinguish: a subscription has one piece of
+state, and every command **replaces** it.
+
+| From | Command | To |
+|---|---|---|
+| not subscribed | `subscribe_notifications(["channel_closed"])` | subscribed to `channel_closed` |
+| subscribed to `A` | `subscribe_notifications(["B"])` | subscribed to `B` — **replaced, not merged** |
+| subscribed | `subscribe_notifications([])` | not subscribed |
+| subscribed | the controller's grant is revoked or narrowed | not subscribed |
+
+Replacement rather than accumulation is deliberate: a controller can state
+what it wants without knowing what it previously asked for, so a
+reconnecting client is one command away from a known state rather than
+having to reconcile. It also means the node service holds one bounded set
+per controller and nothing that grows.
+
+**Subscriptions are not a convenience for the asynchronous case.** Some
+events follow from no command at all — a peer force-closing a channel, a
+peer broadcasting a revoked state, a peer opening a channel to this node —
+and a subscription is the only way to learn of them. A controller that
+exists to monitor a node needs this source, not the first one.
 
 ## Events
 
@@ -116,7 +220,7 @@ Follows the NIP-47 rule: every field whose value is denominated in sats MUST use
 ### Error Codes
 
 - `RATE_LIMITED`: The client is sending commands too fast. It should retry in a few seconds.
-- `NOT_IMPLEMENTED`: The command is not known or is intentionally not implemented.
+- `NOT_IMPLEMENTED`: The method is not known or is intentionally not implemented.
 - `RESTRICTED`: This public key is not allowed to do this operation.
 - `UNAUTHORIZED`: This public key has no node connected.
 - `QUOTA_EXCEEDED`: The controller has exceeded its spending quota.
@@ -140,11 +244,13 @@ The **client** uses its own key pair to sign events and encrypt payloads. The **
 nostr+nodecontrol://b889ff5b1513b641e2a139f661a661364979c5beee91842f8f0ef42ab558e9d4?relay=wss%3A%2F%2Frelay.damus.io
 ```
 
-## Commands
+## Methods
 
 ### Channel Management
 
 #### `list_channels`
+
+**Synchronous.** A command calling this method gets its result in the response.
 
 Description: Lists the node's channels with their current status and balances.
 
@@ -181,6 +287,8 @@ Response:
 
 #### `open_channel`
 
+**Asynchronous.** A command calling this method is acknowledged; the outcome arrives later as a `channel_opened` notification. See [Commands and Notifications](#commands-and-notifications).
+
 Description: Opens a channel to a peer. If not already connected, the **node service** SHOULD connect to the peer first.
 
 Request:
@@ -207,12 +315,14 @@ Response:
 }
 ```
 
-The response confirms the channel open was accepted. The `funding_txid` is delivered asynchronously via the `channel_opened` notification (kind 23200) once the funding transaction is broadcast.
+The response confirms the channel open was accepted. The `funding_txid` is delivered asynchronously via the `channel_opened` notification (kind 23200) once the funding transaction is confirmed.
 
 Errors:
 - `CHANNEL_FAILED`: The channel could not be opened. This may be due to insufficient funds, peer refusing, or similar.
 
 #### `close_channel`
+
+**Asynchronous.** A command calling this method is acknowledged; the outcome arrives later as a `channel_closed` notification. See [Commands and Notifications](#commands-and-notifications).
 
 Description: Closes a channel. Defaults to a cooperative close; set `force` to true for a force close.
 
@@ -247,6 +357,8 @@ Errors:
 
 #### `list_peers`
 
+**Synchronous.** A command calling this method gets its result in the response.
+
 Description: Lists the node's connected peers.
 
 Request:
@@ -277,6 +389,8 @@ Response:
 
 #### `connect_peer`
 
+**Synchronous.** A command calling this method gets its result in the response.
+
 Description: Connects to a peer.
 
 Request:
@@ -302,6 +416,8 @@ Errors:
 - `CONNECTION_FAILED`: Could not connect to the peer.
 
 #### `disconnect_peer`
+
+**Synchronous.** A command calling this method gets its result in the response.
 
 Description: Disconnects from a peer.
 
@@ -329,6 +445,8 @@ Errors:
 ### Fees & Routing
 
 #### `get_channel_fees`
+
+**Synchronous.** A command calling this method gets its result in the response.
 
 Description: Gets the fee policies for the node's channels.
 
@@ -364,6 +482,8 @@ Response:
 
 #### `set_channel_fees`
 
+**Synchronous.** A command calling this method gets its result in the response.
+
 Description: Updates the fee policy for a channel or all channels.
 
 Request:
@@ -392,6 +512,8 @@ Errors:
 - `NOT_FOUND`: The channel was not found.
 
 #### `get_forwarding_history`
+
+**Synchronous.** A command calling this method gets its result in the response.
 
 Description: Lists forwarded payments (routing events).
 
@@ -429,6 +551,8 @@ Response:
 
 #### `get_pending_htlcs`
 
+**Synchronous.** A command calling this method gets its result in the response.
+
 Description: Lists in-flight HTLCs across channels.
 
 Request:
@@ -460,6 +584,8 @@ Response:
 **Note:** Fee estimation methods (`estimate_onchain_fees` and `estimate_routing_fees`) are defined in [NIP-47](47.md) as wallet operations.
 
 #### `query_routes`
+
+**Synchronous.** A command calling this method gets its result in the response.
 
 Description: Finds possible routes to a destination.
 
@@ -505,6 +631,8 @@ Errors:
 
 #### `list_network_nodes`
 
+**Synchronous.** A command calling this method gets its result in the response.
+
 Description: Lists nodes in the public network graph.
 
 Request:
@@ -542,6 +670,8 @@ Response:
 
 #### `get_network_stats`
 
+**Synchronous.** A command calling this method gets its result in the response.
+
 Description: Gets aggregate statistics about the network graph.
 
 Request:
@@ -567,6 +697,8 @@ Response:
 ```
 
 #### `get_network_node`
+
+**Synchronous.** A command calling this method gets its result in the response.
 
 Description: Gets information about a specific node in the network graph.
 
@@ -603,6 +735,8 @@ Errors:
 - `NOT_FOUND`: The node was not found in the graph.
 
 #### `get_network_channel`
+
+**Synchronous.** A command calling this method gets its result in the response.
 
 Description: Gets information about a specific channel in the network graph.
 
@@ -653,6 +787,8 @@ Errors:
 ### Node Identity
 
 #### `sign_message`
+
+**Synchronous.** A command calling this method gets its result in the response.
 
 Description: Signs a message with the node's **Lightning identity key** —
 the `node_id` it announces to its peers. This is not the Nostr key the
@@ -734,16 +870,38 @@ that simply names the key it wishes it were is not a proof.
 
 ### Notification Model
 
-**Default behavior**: A controller is notified about deferred outcomes of operations it initiates. This mirrors the NIP-47 notification model.
+A notification is a kind `23200` event. It reaches a controller by one of
+**two independent routes**, defined in
+[Commands and Notifications](#commands-and-notifications): as the outcome of an
+**asynchronous command** it issued, or through a **subscription**. The same
+notification type can arrive by either.
 
-- `open_channel` → `channel_opened` when the channel is confirmed on-chain
-- `close_channel` → `channel_closed` when the close is confirmed on-chain
+#### Delivery
 
-**Opt-out**: Set `"notify": false` in the request to suppress the notification for that specific operation.
+- A controller that both initiated an operation and subscribed to its type
+  receives **one** notification for it, not two.
+- An event with no initiating call is delivered to subscribers only.
+- `"notify": false` suppresses the asynchronous-command route for that
+  operation. It does **not** suppress a subscription: a controller that
+  subscribed to a type has asked to see every event of that type.
+- **A subscription lives and dies with the grant that permitted it.** When
+  a controller's grant is revoked, or narrowed so that
+  `subscribe_notifications` is no longer permitted, its subscription ends
+  and it MUST receive nothing further. A subscription that outlives its
+  grant is a revocation that does not revoke.
 
-**Subscription**: Controllers that need to monitor _all_ channel events (e.g. a dashboard that didn't initiate the open/close) should use the `subscribe_notifications` method.
+Payment-related notifications (`payment_received`, `payment_sent`) belong
+to NIP-47 (NWC).
 
 #### `subscribe_notifications`
+
+**Synchronous.** A command calling this method gets its result in the
+response; what it changes is which notifications arrive later. See
+[Subscriptions](#subscriptions).
+
+Description: Sets the notification types this controller receives, whatever
+caused them. **Replaces** any previous set for this controller; an empty
+`types` array clears it.
 
 Request:
 ```jsonc
@@ -777,7 +935,7 @@ Payment-related notifications (`payment_received`, `payment_sent`) belong to NIP
 
 ### `channel_opened`
 
-Description: Sent when a channel from an `open_channel` request has been confirmed on-chain and is now active.
+Description: Sent when a channel has been confirmed on-chain and is now active. Delivered to the controller whose `open_channel` request opened it, and to any controller subscribed to this type — including for a channel a peer opened to this node, which no controller requested.
 
 Notification:
 ```jsonc
@@ -798,7 +956,7 @@ Notification:
 
 ### `channel_closed`
 
-Description: Sent when a channel from a `close_channel` request has been confirmed on-chain.
+Description: Sent when a channel close has been confirmed on-chain. Delivered to the controller whose `close_channel` request closed it, and to any controller subscribed to this type — including for a close no controller requested, which `close_type` distinguishes: a peer's force-close is `force_remote`, and a revoked-state broadcast is `breach`.
 
 Notification:
 ```jsonc
@@ -1098,7 +1256,7 @@ The two protocols use separate connection URIs and separate key pairs, allowing 
 ## Example Flow
 
 1. The node operator configures their **node service** and scans or copies the `nostr+nodecontrol://` URI into their **client** application.
-2. The **client** fetches the NNC info event (kind `13198`) from the relay to learn which NNC commands are available.
+2. The **client** fetches the NNC info event (kind `13198`) from the relay to learn which NNC methods are available.
 3. The user wants to open a channel. The **client** creates an `open_channel` request with `"notify": true`, encrypts it with NIP-44, and publishes kind `23198` to the relay.
 4. The **node service** decrypts the request, calls the Lightning node's channel open API, and publishes an encrypted kind `23199` response with the funding transaction ID.
 5. Once the channel is confirmed on-chain, the **node service** sends a `channel_opened` notification (kind `23200`) back to the **client** that made the request.
