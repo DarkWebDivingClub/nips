@@ -1415,6 +1415,15 @@ Values that are **valid**, and should not be rejected:
 
 #### What the quota counts
 
+> **Known defect, not yet fixed.** What follows describes the quota as
+> currently specified, and it under-counts: the node spends `amount + fee`
+> while only `amount` is checked and recorded, on **every** spending call.
+> The check must instead be **absolute** — taken against the full cost,
+> before anything moves — which the pipeline cannot express today, because
+> the true cost exists only between step 4 and step 6. See
+> [nostr-ln#1](https://github.com/DarkWebDivingClub/nostr-ln/issues/1).
+
+
 `quota` is a bucket like any other, and **one token is one satoshi**. What
 the specification must say, and until now did not, is *how many satoshis a
 given request costs* — because a limit whose cost is undefined is not a
@@ -1440,7 +1449,12 @@ limits — LND's `--fee_limit`, LDK's `max_total_routing_fee_msat`. What
 varies is the *exact* fee, which depends on the route finally taken and can
 differ across retries; an upper bound is available throughout.
 
-The reason is that **the request carries no bound to check against**.
+The reason given here is that **the request carries no bound to check
+against** — which is true of the request and **irrelevant to the node**,
+since the node picks a feerate before funding and computes a route before
+paying. That is why this is recorded above as a defect rather than a
+design: the check belongs where the node knows the total, not where the
+request happens to carry a number.
 NIP-47's `PayInvoiceRequest` is an invoice and an optional amount, with no
 fee-limit field, so a node service has nothing in the request from which to
 derive a fee-inclusive cost at pipeline step 4. Counting fees would
