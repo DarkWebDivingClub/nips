@@ -216,7 +216,11 @@ If the command was successful, the `error` field must be null.
 
 ### Notification Event (kind 23200)
 
-The notification event is sent only in response to a request that had `"notify": true`. It SHOULD contain one `p` tag with the public key of the requesting **client** and an `e` tag with the id of the original request event.
+A notification event reaches a controller by one of the two routes in [Commands and Notifications](#commands-and-notifications), and its tags differ accordingly.
+
+- It MUST contain one `p` tag with the public key of the receiving **controller**.
+- **As the deferred result of an asynchronous command**, it MUST also contain an `e` tag with the id of the original request event. This is what lets a client tie an outcome to the command that caused it, rather than guessing from content — two `open_channel` commands to the same peer are otherwise indistinguishable. Suppressed by `"notify": false`.
+- **As the delivery of a subscription**, there is no originating request, so there is no `e` tag. A peer force-closing a channel follows from no command at all.
 
 The content is encrypted with [NIP-44](44.md) and is a JSON object:
 
