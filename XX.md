@@ -1002,6 +1002,8 @@ Notification:
 
 All NNC request, response, and notification payloads MUST be encrypted using [NIP-44](44.md). The encryption uses the **client**'s private key and the **node service**'s public key.
 
+[Subscriptions](#subscriptions-kind-30199) (kind `30199`) are encrypted the same way, controller to node service. [Access grants](#access-grants-kind-30198) (kind `30198`) are **not**, for the reason below.
+
 ### Access grants are not encrypted
 
 **Kind `30198` access grant content is plaintext**, and this is stated so
@@ -1032,6 +1034,15 @@ so it cannot address both, which is what that section exists to solve.
 When it is adopted, a grant's readers are the **node service**, the
 **controller** it names, and the **owner** that wrote it — the last so that
 an owner can read back what it published.
+
+#### Why subscriptions are not deferred with them
+
+[Subscriptions](#subscriptions-kind-30199) (kind `30199`) **are**
+encrypted, and the difference is arity rather than importance. A
+subscription has two readers — its author and the node service — so
+pairwise NIP-44 addresses it exactly, with nothing new to build. The reason
+grants wait does not apply, and a kind is not left plaintext by inheritance
+from the kind it was split out of.
 
 ## Encrypting Content for Multiple Readers
 
@@ -1326,8 +1337,9 @@ notification types it wants to receive.
 - The event `tags` MUST include a `p` tag with the **node service**'s
   pubkey so it receives the event.
 - The event `content` is a JSON array of notification type names, e.g.
-  `["channel_opened", "channel_closed"]`. An empty array subscribes to
-  nothing.
+  `["channel_opened", "channel_closed"]`, **encrypted with
+  [NIP-44](44.md)** using the controller's private key and the node
+  service's public key. An empty array subscribes to nothing.
 - Subsequent updates use the same kind, pubkey and `d` tag; the newest
   `created_at` replaces earlier subscriptions.
 
@@ -1339,9 +1351,30 @@ notification types it wants to receive.
         ["d", "<node_pubkey>"],
         ["p", "<node_pubkey>"]
     ],
-    "content": "[\"channel_closed\"]"
+    // NIP-44 of ["channel_closed"], controller ⇄ node service
+    "content": "<nip44_ciphertext>"
 }
 ```
+
+**A subscription is encrypted and a grant is not**, and the asymmetry is
+deliberate rather than an oversight in one of them. A subscription has
+exactly **two** readers — the controller that wrote it and the node service
+that enforces it — which is what NIP-44 does. A grant has three, so it
+needs [the multi-reader construction](#encrypting-content-for-multiple-readers),
+which is specified below and not yet built; see
+[Access grants are not encrypted](#access-grants-are-not-encrypted).
+
+What this hides is only the list of types. That a given controller talks to
+a given node still leaks, because the `pubkey`, the `d` tag and the `p` tag
+are not encrypted and cannot be — the node has to find the event. It is
+done because the alternative is a specification that reasons about privacy
+for one addressable kind and passes over the kind defined immediately
+after it in silence.
+
+A node service MUST check that the author holds a grant **before**
+attempting to decrypt. Anyone may publish a kind `30199` event naming any
+node, so decrypting first would make an unsolicited event cost an ECDH —
+turning the bound below into an amplifier rather than a limit.
 
 A node service MUST verify that the `d` tag names itself before applying a
 subscription, exactly as it does for a grant. It MUST NOT accept a
