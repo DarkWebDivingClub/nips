@@ -1114,6 +1114,37 @@ one; leave it empty if there is no hint to give.
   element beyond "not addressed to this reader": the same event may
   address others.
 
+#### It must work with a remote signer
+
+Not a nicety. Where this construction is used for access grants, the author
+is the **owner** — whose key is the only one a node service accepts grants
+from, and therefore the key most likely to be held on separate hardware or
+behind [NIP-46](46.md). An implementation that requires the author's secret
+key in the process doing the sealing excludes exactly the deployment that
+most wants encrypted grants.
+
+The construction supports it, and an implementation should be checked
+against a signer rather than assumed to work with one. Only the wrapped
+keys need the author's identity:
+
+| Operation | Needs the author's key |
+|---|---|
+| encrypt the content | **no** — see below |
+| wrap the one-time secret to each reader | yes |
+| unwrap one's own copy | yes, the reader's |
+| decrypt the content | no — the one-time secret is local |
+
+The content is encrypted under `conv(a, T)`, which by NIP-44's own symmetry
+equals `conv(t, A)` — computable from the one-time secret, which the author
+holds locally by construction. So an identity that offers only
+"encrypt to X" and "decrypt from X", as a remote signer does, is
+sufficient.
+
+Note also that such a signer is typically **string-only**, as
+`NostrSigner::nip44_encrypt` is. That is the second reason the wrapped key
+is hex rather than raw bytes, and it means anything crossing the identity
+boundary must be text while local operations may use bytes.
+
 ### What it gives, and what it does not
 
 - **Every reader provably receives the same plaintext**, because there is
