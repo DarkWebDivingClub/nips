@@ -1413,6 +1413,57 @@ Values that are **valid**, and should not be rejected:
   request. This is a legitimate way to say "permitted, but not yet", and
   is distinct from omitting the method, which is `RESTRICTED`.
 
+#### What the quota counts
+
+`quota` is a bucket like any other, and **one token is one satoshi**. What
+the specification must say, and until now did not, is *how many satoshis a
+given request costs* — because a limit whose cost is undefined is not a
+limit.
+
+**A request costs the amount it sends. Fees are not counted.**
+
+| Protocol | Methods that cost | The cost |
+|---|---|---|
+| NNC (this document) | `open_channel` | `amount_sats`, converted to satoshis |
+| NWC ([NIP-47](47.md)) | the paying methods — `pay_invoice`, `pay_keysend`, `pay_onchain` and their kin | the amount sent |
+| both | everything else | **zero** |
+
+Fifteen of NNC's sixteen methods cost nothing. `close_channel` returns
+funds rather than spending them, and the reading methods move nothing at
+all.
+
+##### Why fees are excluded
+
+Not thrift — determinism. A Lightning payment's routing fee is not known
+until it has been paid, and a request cannot bound it: NIP-47's
+`PayInvoiceRequest` carries an invoice and an optional amount, and nothing
+else. If the quota counted fees, its cost could not be computed at pipeline
+step 4, and the node would have to either guess a reserve or discover after
+the fact that a controller had exceeded its limit — after the money moved.
+
+Denominating the quota in what a controller **sends** avoids that entirely,
+and it is also what a controller can reason about: *"I may send one coin a
+week"* is a statement they can act on, where *"I may cost the node one
+coin a week"* depends on routing they do not choose.
+
+##### A quota therefore cannot be exceeded
+
+This is the property the rule exists to produce, and implementations should
+treat losing it as a bug rather than an edge case:
+
+- The cost is a function of the **request**, so it is known at step 4.
+- Step 4 checks that cost without mutating.
+- Step 7 commits **the same cost**, and only if execution succeeded.
+
+There is no estimate, no reserve, and no settlement against a different
+number — so there is no path by which a committed spend exceeds what was
+checked. An implementation that computes its step 7 amount from the
+*response* has reintroduced the problem, and will eventually need to record
+a spend larger than the bucket holds.
+
+A node that wishes to bound what a controller costs it in fees needs a
+separate control; the per-controller quota is not it.
+
 #### How a bucket behaves
 
 A bucket holds tokens. It starts full, at `max_capacity`, when the grant
@@ -1517,7 +1568,7 @@ Step 1 ensures immediate revocation regardless of whether the relay processes th
 4. **Enforce Limits**: Apply rate and quota checks using the controller's access state. Limits are evaluated without mutating state.
 5. **Validate**: Validate the request parameters for the given method. If validation fails, return an error response.
 6. **Execute**: Dispatch the request to the node.
-7. **Commit Usage**: If execution succeeds, apply the rate/quota usage to state. Usage is committed only after the request is accepted for execution.
+7. **Commit Usage**: If execution succeeds, apply the rate/quota usage to state. Usage is committed only after the request is accepted for execution, and the quota amount committed MUST be the one checked at step 4 — not a figure recomputed from the response, which would allow a committed spend to exceed what was authorized.
 
 ### Authorization Steps
 
@@ -1525,7 +1576,7 @@ Step 1 ensures immediate revocation regardless of whether the relay processes th
 2. Parse the grant content as `UsageProfile`. If parsing fails, deny with `UNAUTHORIZED`.
 3. Look up the requested method in the applicable map — `methods` for NWC requests, `control` for NNC requests. If the map is missing, empty, or the requested method is not present and `"OTHERS"` is not present, deny with `RESTRICTED`.
 4. Check per-method rate limit (from the `rate` field on the method entry). If the rate is exceeded, deny with `RATE_LIMITED`.
-5. Check `quota`. If the method involves spending and the quota is exceeded, deny with `QUOTA_EXCEEDED`.
+5. Check `quota`. Compute the request's cost — see *What the quota counts*; it is zero for every method that does not send — and if the bucket cannot cover it, deny with `QUOTA_EXCEEDED`. The check MUST NOT mutate, and the same cost is committed at pipeline step 7.
 6. Grant access.
 
 ## Relationship to NIP-47
