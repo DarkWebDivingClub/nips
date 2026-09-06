@@ -245,6 +245,8 @@ Follows the NIP-47 rule: every field whose value is denominated in sats MUST use
 - `UNAUTHORIZED`: This public key has no node connected.
 - `QUOTA_EXCEEDED`: The controller has exceeded its spending quota.
 - `NOT_FOUND`: The requested resource (channel, peer, node, etc.) was not found.
+- `CHANNEL_FAILED`: A channel operation could not be completed — insufficient funds, the peer refused, or similar.
+- `CONNECTION_FAILED`: A peer could not be reached.
 - `INTERNAL`: An internal error.
 - `OTHER`: Other error.
 
