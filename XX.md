@@ -216,11 +216,37 @@ If the command was successful, the `error` field must be null.
 
 ### Notification Event (kind 23200)
 
-A notification event reaches a controller by one of the two routes in [Commands and Notifications](#commands-and-notifications), and its tags differ accordingly.
+A notification event reaches a controller by one or both of the two routes in [Commands and Notifications](#commands-and-notifications), and **it MUST name what caused it**.
 
 - It MUST contain one `p` tag with the public key of the receiving **controller**.
-- **As the deferred result of an asynchronous command**, it MUST also contain an `e` tag with the id of the original request event. This is what lets a client tie an outcome to the command that caused it, rather than guessing from content — two `open_channel` commands to the same peer are otherwise indistinguishable. Suppressed by `"notify": false`.
-- **As the delivery of a subscription**, there is no originating request, so there is no `e` tag. A peer force-closing a channel follows from no command at all.
+- **As the deferred result of an asynchronous command**, it MUST contain an `e` tag with the id of the original request event. This is what lets a client tie an outcome to the command that caused it, rather than guessing from content — two `open_channel` commands to the same peer are otherwise indistinguishable. Suppressed by `"notify": false`.
+- **As the delivery of a subscription**, it MUST contain an `a` tag whose value is `30199:<controller_pubkey>:<node_pubkey>`, naming the [subscription](#subscriptions-kind-30199) of the controller the notification is addressed to. A peer force-closing a channel follows from no command at all, but it does not follow from nothing: it follows from the subscription that asked to hear about it.
+- **When one notification is both** — the controller issued the command *and* subscribed to the type — it MUST contain **both** tags. See [Delivery](#delivery).
+- A notification containing **neither** tag is malformed. A client MUST ignore it, and SHOULD report the node service as non-conforming rather than discarding it silently.
+
+The `a` tag MUST name the subscription of the controller in the same event's `p` tag, since a notification is addressed to one controller and encrypted to it. A client SHOULD ignore an `a` tag naming any other subscription.
+
+> **Why the subscription route is a MUST and not merely "no `e` tag".**
+> Both obligations are stated in their own right, so that an implementation
+> has a sentence to satisfy on each route and a conformance claim has
+> something to cite. The alternative — requiring the `e` tag and describing
+> the subscription case as its absence — makes a **defect indistinguishable
+> from a legitimate event**: a node service that fails to set the mandatory
+> `e` tag emits something byte-identical to a subscription delivery, and a
+> client cannot tell that anything is wrong. It waits for an outcome that
+> has already arrived and been discarded, and reports only a timeout.
+> Naming the cause positively on both routes turns that silence into a
+> detectable error.
+
+Because the `a` tag is derived per recipient, a node service fanning one event out to several controllers sends a separate notification to each, and each names that controller's own subscription:
+
+```jsonc
+// to a controller that issued the command and is also subscribed
+"tags": [["p", "<controller>"], ["e", "<request_id>"], ["a", "30199:<controller>:<node>"]]
+
+// to every other subscriber
+"tags": [["p", "<other>"], ["a", "30199:<other>:<node>"]]
+```
 
 The content is encrypted with [NIP-44](44.md) and is a JSON object:
 
@@ -901,11 +927,26 @@ notification type can arrive by either.
 #### Delivery
 
 - A controller that both initiated an operation and subscribed to its type
-  receives **one** notification for it, not two.
-- An event with no initiating call is delivered to subscribers only.
+  receives **one** notification for it, not two — and that one notification
+  carries **both** an `e` tag and an `a` tag, because it has two causes and
+  [MUST name them](#notification-event-kind-23200).
+
+  Carrying both is what makes one delivery sufficient. A node service does
+  not have to notice that a caller is also a subscriber and suppress
+  something, and a client is not left to guess which route a single tag
+  meant. Both of a client's mechanisms may act on it: the handle awaiting
+  that command resolves, **and** the subscription stream receives it. Those
+  are ordinarily two different consumers in the same application — a
+  dashboard's button stops spinning, and its channel list updates — and
+  neither should have to know the other exists.
+- An event with no initiating call is delivered to subscribers only, with
+  an `a` tag and no `e` tag.
 - `"notify": false` suppresses the asynchronous-command route for that
   operation. It does **not** suppress a subscription: a controller that
-  subscribed to a type has asked to see every event of that type.
+  subscribed to a type has asked to see every event of that type. The two
+  together are a coherent request — *do not send me a correlated result, I
+  will see it on my subscription* — and produce one notification carrying
+  an `a` tag and no `e` tag.
 - **A subscription lives and dies with the grant that permits it.** A
   subscription event grants nothing by itself: it states what a controller
   *wants*, and the grant states what it *may have*. Delivery is the
