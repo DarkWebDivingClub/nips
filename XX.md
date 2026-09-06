@@ -1434,17 +1434,29 @@ all.
 
 ##### Why fees are excluded
 
-Not thrift — determinism. A Lightning payment's routing fee is not known
-until it has been paid, and a request cannot bound it: NIP-47's
-`PayInvoiceRequest` carries an invoice and an optional amount, and nothing
-else. If the quota counted fees, its cost could not be computed at pipeline
-step 4, and the node would have to either guess a reserve or discover after
-the fact that a controller had exceeded its limit — after the money moved.
+**Not because a fee is unknowable.** It is: `query_routes` in this document
+returns `total_fee` before anything is sent, and implementations take fee
+limits — LND's `--fee_limit`, LDK's `max_total_routing_fee_msat`. What
+varies is the *exact* fee, which depends on the route finally taken and can
+differ across retries; an upper bound is available throughout.
 
-Denominating the quota in what a controller **sends** avoids that entirely,
-and it is also what a controller can reason about: *"I may send one coin a
-week"* is a statement they can act on, where *"I may cost the node one
-coin a week"* depends on routing they do not choose.
+The reason is that **the request carries no bound to check against**.
+NIP-47's `PayInvoiceRequest` is an invoice and an optional amount, with no
+fee-limit field, so a node service has nothing in the request from which to
+derive a fee-inclusive cost at pipeline step 4. Counting fees would
+therefore mean guessing a reserve, or committing at step 7 a figure larger
+than step 4 approved.
+
+That is a gap in the paying methods rather than a fact about Lightning, and
+it could be closed: a request carrying a fee limit would make
+`amount + max_fee` a real upper bound, checkable before execution and never
+exceeded. Until such a field exists, the quota counts what is actually
+knowable from a request.
+
+Denominating it in what a controller **sends** is also what a controller
+can reason about: *"I may send one coin a week"* is a statement they can
+act on, where *"I may cost the node one coin a week"* depends on routing
+they do not choose.
 
 ##### A quota therefore cannot be exceeded
 
